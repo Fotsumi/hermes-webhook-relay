@@ -1,5 +1,6 @@
 services:
   hermes-webhook-relay:
+    container_name: hermes-webhook-relay
     build:
       context: .
     volumes:
