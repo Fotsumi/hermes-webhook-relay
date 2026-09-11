@@ -1,13 +1,27 @@
 import hashlib
 import hmac
+import json
 import os
-import time
 
 from aiohttp import ClientSession, ClientTimeout, web
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def verify_provider_signature(body: bytes, request: web.Request) -> None:
-    secret = os.environ["PROVIDER_SECRET"]
+    if not env_bool("PROVIDER_SIGNATURE_REQUIRED", True):
+        return
+
+    secret = os.getenv("PROVIDER_SECRET")
+    if not secret:
+        raise web.HTTPInternalServerError(
+            text="PROVIDER_SECRET is required"
+        )
     header = os.getenv("PROVIDER_SIGNATURE_HEADER", "X-Provider-Signature")
     algorithm = os.getenv("PROVIDER_SIGNATURE_ALGORITHM", "hmac-sha256")
     encoding = os.getenv("PROVIDER_SIGNATURE_ENCODING", "hex")
@@ -40,15 +54,53 @@ def verify_provider_signature(body: bytes, request: web.Request) -> None:
         raise web.HTTPUnauthorized(text="Invalid provider signature")
 
 
+def map_payload_for_hermes(payload: dict) -> dict:
+    if not env_bool("PAYLOAD_MAPPING_ENABLED", True):
+        return payload
+
+    source = os.getenv("PAYLOAD_EVENT_SOURCE", "event_name")
+    target = os.getenv("PAYLOAD_EVENT_TARGET", "event_type")
+
+    if not source or not target or source == target:
+        return payload
+
+    if source not in payload or target in payload:
+        return payload
+
+    mapped = dict(payload)
+    mapped[target] = mapped[source]
+    return mapped
+
+
 async def webhook(request: web.Request) -> web.Response:
-    body = await request.read()
-    verify_provider_signature(body, request)
+    raw_body = await request.read()
+    verify_provider_signature(raw_body, request)
 
     hermes_url = os.environ["HERMES_URL"]
     hermes_secret = os.environ["HERMES_SECRET"]
 
-    # v0.1 forwards the original body unchanged.
-    # Hermes V1 signs the body directly with HMAC-SHA256.
+    body = raw_body
+    if env_bool("PAYLOAD_MAPPING_ENABLED", True):
+        try:
+            payload = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise web.HTTPBadRequest(text="Invalid JSON payload") from exc
+
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="JSON payload must be an object")
+
+        payload = map_payload_for_hermes(payload)
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    signature = hmac.new(
+        hermes_secret.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
     signature = hmac.new(
         hermes_secret.encode("utf-8"),
         body,
@@ -56,9 +108,7 @@ async def webhook(request: web.Request) -> web.Response:
     ).hexdigest()
 
     headers = {
-        "Content-Type": request.headers.get(
-            "Content-Type", "application/json"
-        ),
+        "Content-Type": "application/json",
         "X-Webhook-Signature": signature,
     }
 
