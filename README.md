@@ -173,21 +173,96 @@ The relay also has an egress network so it can forward to Hermes even when the p
 
 No host port is published by default.
 
-## Example
+## Calling the relay
 
-For a provider sending:
+The relay is a plain HTTP `POST` endpoint. A provider calls it exactly like any
+webhook destination: send the request body plus the signature the
+`PROVIDER_SIGNATURE_HEADER` expects (see below for how that signature is
+computed). The provider never has to know anything about Hermes — the relay
+adapter strips the provider signature and attaches the Hermes one.
 
-```text
-X-Provider-Signature: abc123...
+### Single route (no `WEBHOOK_MAP`)
+
+Default endpoint: `POST /webhook`. The provider signs the **raw request body**
+with `PROVIDER_SECRET` using HMAC-SHA256 (hex-encoded, optional `sha256=`
+prefix), and sends it in `PROVIDER_SIGNATURE_HEADER`:
+
+```bash
+curl -X POST http://hermes-webhook-relay:8080/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Provider-Signature: <hex hmac-sha256(PROVIDER_SECRET, body)>" \
+  -d '{"event_name":"task.created","task_id":42}'
 ```
 
-the relay verifies that signature and sends the same body to Hermes with:
+That signature above is:
 
 ```text
-X-Webhook-Signature: <new Hermes signature>
+HMAC-SHA256(PROVIDER_SECRET, '{"event_name":"task.created","task_id":42}')
 ```
 
-The original provider signature is not forwarded.
+computable locally with, e.g.:
+
+```bash
+body='{"event_name":"task.created","task_id":42}'
+printf '%s' "$body" | openssl dgst -sha256 -hmac 'replace-me'
+```
+
+With the default global mapping (`PAYLOAD_EVENT_SOURCE=event_name`,
+`PAYLOAD_EVENT_TARGET=event_type`), the relay verifies the provider signature,
+then re-signs the transformed body for Hermes and forwards it:
+
+```text
+POST http://hermes-address:8644/webhooks/example
+X-Webhook-Signature: <hex hmac-sha256(HERMES_SECRET, body')>
+Content-Type: application/json
+
+{"event_name":"task.created","task_id":42,"event_type":"task.created"}
+```
+
+`event_type` was added with the value of `event_name`; all original fields are
+preserved. If the body has no `event_name`, or already has `event_type`, it is
+forwarded byte-for-byte unchanged. The provider's `X-Provider-Signature` is
+never forwarded.
+
+### Multi-route (`WEBHOOK_MAP`)
+
+Each configured path is its own endpoint with its own destination, secrets,
+signature settings, and (optionally) its own mapping. The provider targets the
+route path directly; the route's secret and settings are used for verification.
+
+```bash
+curl -X POST http://hermes-webhook-relay:8080/webhook1 \
+  -H "Content-Type: application/json" \
+  -H "X-Provider-Signature: <hex hmac-sha256(WEBHOOK1_PROVIDER_SECRET, body)>" \
+  -d '{"event_name":"invoice.paid","amount":0.5,"currency":"usd"}'
+```
+
+`/webhook1` in the example config verifies with `WEBHOOK1_PROVIDER_SECRET`,
+enables mapping (`event_name` → `event_type`), and forwards to
+`http://hermes-address:8644/webhooks/webhook1`:
+
+```text
+X-Webhook-Signature: <hex hmac-sha256(WEBHOOK1_HERMES_SECRET, body')>
+Content-Type: application/json
+
+{"event_name":"invoice.paid","amount":0.5,"currency":"usd","event_type":"invoice.paid"}
+```
+
+`/webhook2` uses its own secrets (`WEBHOOK2_PROVIDER_SECRET` /
+`WEBHOOK2_HERMES_SECRET`) and, having no mapping overrides, falls back to the
+global `PAYLOAD_*` defaults (mapping enabled, `event_name` → `event_type`):
+
+```bash
+curl -X POST http://hermes-webhook-relay:8080/webhook2 \
+  -H "Content-Type: application/json" \
+  -H "X-Provider-Signature: <hex hmac-sha256(WEBHOOK2_PROVIDER_SECRET, body)>" \
+  -d '{"event_name":"task.updated","n":2}'
+```
+
+In both modes the relay verifies the provider signature against the original
+raw body, then signs for Hermes with the route's `HERMES_SECRET` and sends the
+result as `X-Webhook-Signature`. The original provider signature header is
+always dropped.
 
 ## Testing
 
