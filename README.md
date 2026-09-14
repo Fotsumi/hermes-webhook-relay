@@ -53,6 +53,94 @@ X-Webhook-Signature: <hex signature>
 
 This corresponds to Hermes' legacy V1 webhook signature format.
 
+## Multiple routes (`WEBHOOK_MAP`)
+
+The relay is generic: a single process can expose any number of inbound paths,
+each forwarding to a configured upstream destination. The topology is defined
+entirely by environment configuration — the relay never knows what a path or
+destination represents.
+
+`WEBHOOK_MAP` is a JSON object mapping each inbound `POST` path to a
+destination. When it is set, each key is exposed as a relay path; when it is
+unset, the relay keeps the original single-route behavior: `POST /webhook`
+forwarding to `HERMES_URL`.
+
+A destination may be either a URL string (reusing the global `PROVIDER_SECRET`,
+`HERMES_SECRET`, and `PROVIDER_SIGNATURE_*` settings) or an object with its own
+secrets referenced by environment-variable name (so secret values never sit
+inside the map):
+
+```yaml
+WEBHOOK_MAP: '{
+  "/webhook1": {
+    "url": "http://hermes-address:8644/webhooks/webhook1",
+    "provider_secret_env": "WEBHOOK1_PROVIDER_SECRET",
+    "hermes_secret_env": "WEBHOOK1_HERMES_SECRET",
+    "provider_signature_header": "X-Provider-Signature",
+    "provider_signature_algorithm": "hmac-sha256",
+    "provider_signature_encoding": "hex",
+    "provider_signature_prefix": "",
+    "payload_mapping_enabled": true,
+    "payload_event_source": "event_name",
+    "payload_event_target": "event_type"
+  },
+  "/webhook2": {
+    "url": "http://hermes-address:8644/webhooks/webhook2",
+    "provider_secret_env": "WEBHOOK2_PROVIDER_SECRET",
+    "hermes_secret_env": "WEBHOOK2_HERMES_SECRET"
+  }
+}'
+WEBHOOK1_PROVIDER_SECRET: <secret>
+WEBHOOK1_HERMES_SECRET: <secret>
+WEBHOOK2_PROVIDER_SECRET: <secret>
+WEBHOOK2_HERMES_SECRET: <secret>
+```
+
+Provider signature verification is per-route. Each route may override the
+signature header, algorithm, encoding, prefix, and whether verification is
+required:
+
+- `provider_signature_header` — the header to read the signature from
+- `provider_signature_algorithm` — signature algorithm (`hmac-sha256`)
+- `provider_signature_encoding` — signature encoding (`hex`)
+- `provider_signature_prefix` — optional prefix such as `sha256=`
+- `provider_signature_required` — `true`/`false`, e.g. to disable
+  verification for a route
+
+Any key omitted on a route (and the URL-string form entirely) falls back to the
+corresponding global `PROVIDER_SIGNATURE_HEADER` / `PROVIDER_SIGNATURE_ALGORITHM` /
+`PROVIDER_SIGNATURE_ENCODING` / `PROVIDER_SIGNATURE_PREFIX` /
+`PROVIDER_SIGNATURE_REQUIRED` variables, whose defaults remain
+`X-Provider-Signature`, `hmac-sha256`, `hex`, empty, and `true`.
+
+Payload mapping is likewise per-route, using the same fallback pattern:
+
+- `payload_mapping_enabled` — `true`/`false`, enable event-field mapping for
+  this route
+- `payload_event_source` — source field copied to the target
+- `payload_event_target` — target field added on the payload
+
+Any payload key omitted falls back to the global `PAYLOAD_MAPPING_ENABLED` /
+`PAYLOAD_EVENT_SOURCE` / `PAYLOAD_EVENT_TARGET` variables, whose defaults remain
+`true`, `event_name`, `event_type`. Legacy single `/webhook` mode (no
+`WEBHOOK_MAP`) always uses the global `PAYLOAD_*` values. When mapping is
+enabled the relay parses the JSON object, copies the source field into the
+target field (only when the source exists and the target does not), and
+preserves all original fields; when disabled it forwards the original body
+byte-for-byte untransformed.
+
+The incoming request path alone selects the destination; a client can never
+supply or override the upstream URL, and any unconfigured path is a 404.
+Provider signature verification always runs against the original raw request
+body before payload parsing/transformation, and the Hermes-facing signature is
+independent: HMAC-SHA256 over the exact transformed body, sent as
+`X-Webhook-Signature` (V1).
+
+Malformed configuration fails fast at startup with a clear message and a
+non-zero exit: invalid JSON, empty map, invalid/short path, reserved `/health`
+path, empty or non-http(s) destination, unknown keys, duplicate paths, or a
+referenced secret variable that is not set.
+
 ## Docker Compose
 
 Copy the example environment:
@@ -121,7 +209,5 @@ More generic adaptation features can be added in later versions, for example:
 
 - Hermes V2 timestamp signatures
 - provider event header mapping
-- payload field mapping
 - selected header mapping
 - configurable event filtering
-- multiple relay routes
