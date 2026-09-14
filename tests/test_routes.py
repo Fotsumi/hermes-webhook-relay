@@ -626,5 +626,178 @@ class StartupValidationTest(unittest.TestCase):
                 create_app()
 
 
+class LoggingTest(unittest.TestCase):
+    def _capture(self, app_logger, body, headers, env, path="/webhook",
+                 upstream=None):
+        """POST once, return parsed JSON log lines captured via assertLogs."""
+        import logging
+
+        from app.main import JsonFormatter
+
+        formatter = JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S%z")
+        with patch.dict(os.environ, env, clear=False):
+            app = create_app()
+        with self.assertLogs(app_logger, level="INFO") as cm:
+            with patch.dict(os.environ, env, clear=False):
+                r = run(_post(app, path, body, headers))
+        records = []
+        for rec in cm.records:
+            records.append(json.loads(formatter.format(rec)))
+        return r, records
+
+    def _env(self, upstream, **extra):
+        env = {
+            "HERMES_URL": upstream.base_url + "/hermes",
+            "HERMES_SECRET": "h1",
+            "PROVIDER_SECRET": "p1",
+        }
+        env.update(extra)
+        return env
+
+    def test_successful_request_emits_access_log(self):
+        import logging
+
+        from app.main import LOG
+        upstream = FakeHermes()
+        upstream.start()
+        try:
+            env = self._env(upstream)
+            body = b'{"event_name":"task.created"}'
+            r, records = self._capture(
+                LOG, body, {
+                    "Content-Type": "application/json",
+                    "X-Provider-Signature": sign("p1", body),
+                }, env)
+            assert r.status == 200, r.status
+            assert len(records) == 1, records
+            rec = records[0]
+            assert rec["http_method"] == "POST"
+            assert rec["request_path"] == "/webhook"
+            assert rec["status"] == 200
+            assert rec["outcome"] == "accepted"
+            assert rec["body_bytes"] == len(body)
+            assert rec["provider_signature_verification_enabled"] is True
+            assert rec["provider_signature_present"] is True
+            assert rec["hermes_upstream_status"] == 200
+            assert rec["hermes_upstream_url"] == upstream.base_url + "/hermes"
+            assert rec["timestamp"] and rec["level"] == "INFO"
+            assert "duration_ms" in rec
+        finally:
+            upstream.stop()
+
+    def test_signature_rejection_emits_access_log(self):
+        import logging
+
+        from app.main import LOG
+        upstream = FakeHermes()
+        upstream.start()
+        try:
+            env = self._env(upstream)
+            body = b'{"event_name":"task.created"}'
+            r, records = self._capture(
+                LOG, body, {
+                    "Content-Type": "application/json",
+                    "X-Provider-Signature": sign("wrong", body),
+                }, env)
+            assert r.status == 401, r.status
+            assert len(records) == 1, records
+            rec = records[0]
+            assert rec["status"] == 401
+            assert rec["outcome"] == "provider_signature_rejected"
+            assert rec["provider_signature_present"] is True
+            assert rec["hermes_upstream_url"] is None
+            assert rec["hermes_upstream_status"] is None
+        finally:
+            upstream.stop()
+
+    def test_upstream_failure_emits_access_log(self):
+        import logging
+
+        from app.main import LOG
+        env = {
+            "HERMES_URL": "http://127.0.0.1:1/hermes",  # nothing listens
+            "HERMES_SECRET": "h1",
+            "PROVIDER_SECRET": "p1",
+        }
+        body = b'{"event_name":"task.created"}'
+        r, records = self._capture(
+            LOG, body, {
+                "Content-Type": "application/json",
+                "X-Provider-Signature": sign("p1", body),
+            }, env)
+        assert r.status == 502, r.status
+        assert len(records) == 1, records
+        rec = records[0]
+        assert rec["status"] == 502
+        assert rec["outcome"] == "upstream_error"
+        assert rec["hermes_upstream_status"] is None
+        assert rec["hermes_upstream_url"] == "http://127.0.0.1:1/hermes"
+
+    def test_secrets_and_body_never_logged(self):
+        import logging
+
+        from app.main import LOG
+        upstream = FakeHermes()
+        upstream.start()
+        try:
+            secret = "super-secret-provider-value-12345"
+            hermes_secret = "super-secret-hermes-value-67890"
+            env = self._env(upstream, PROVIDER_SECRET=secret)
+            body = b'{"event_name":"task.created","secret":"sensitive-field","password":"hunter2"}'
+            r, records = self._capture(
+                LOG, body, {
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer tok-3579",
+                    "Cookie": "session=abc123",
+                    "X-Webhook-Signature": sign(hermes_secret, body),
+                    "X-Provider-Signature": sign(secret, body),
+                }, env)
+            assert r.status == 200, r.status
+            blobs = json.dumps(records)
+            assert secret not in blobs
+            assert hermes_secret not in blobs
+            assert "hunter2" not in blobs
+            assert "sensitive-field" not in blobs
+            assert "session=abc123" not in blobs
+            assert "tok-3579" not in blobs
+            assert "abc123" not in blobs
+        finally:
+            upstream.stop()
+
+    def test_logs_emit_to_stdout(self):
+        import logging
+        import sys
+
+        from app.main import configure_logging
+        configure_logging()
+        root = logging.getLogger()
+        handlers = [
+            h for h in root.handlers
+            if isinstance(h, logging.StreamHandler)
+        ]
+        assert handlers, "no StreamHandler configured"
+        assert any(h.stream is sys.stdout for h in handlers)
+
+    def test_log_level_configuration(self):
+        import logging
+
+        from app.main import configure_logging
+        with patch.dict(os.environ, {"LOG_LEVEL": "ERROR"}, clear=False):
+            configure_logging()
+        assert logging.getLogger().level == logging.ERROR
+        # INFO below threshold must be suppressed by the configured handler.
+        records = []
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+        cap = _Cap()
+        logging.getLogger().addHandler(cap)
+        try:
+            logging.getLogger("app.main").info("should be filtered")
+            assert records == [], records
+        finally:
+            logging.getLogger().removeHandler(cap)
+
+
 if __name__ == "__main__":
     unittest.main()
