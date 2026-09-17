@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from app.main import create_app
+from app.main import JsonFormatter, create_app
 
 
 def sign(secret: str, body: bytes, prefix: str = "") -> str:
@@ -797,6 +797,117 @@ class LoggingTest(unittest.TestCase):
             assert records == [], records
         finally:
             logging.getLogger().removeHandler(cap)
+
+
+class DedupTest(unittest.TestCase):
+    """Duplicate suppression: identical re-deliveries are swallowed only when
+    the first one already reached Hermes OK, and only within the window."""
+
+    def _env(self, upstream, **extra):
+        env = {
+            "HERMES_URL": upstream.base_url + "/hermes",
+            "HERMES_SECRET": "h1",
+            "PROVIDER_SECRET": "p1",
+        }
+        env.update(extra)
+        return env
+
+    def _sign(self, body):
+        return sign("p1", body)
+
+    def test_identical_body_within_window_is_suppressed(self):
+        upstream = FakeHermes()
+        upstream.start()
+        try:
+            env = self._env(upstream)
+            with patch.dict(os.environ, env, clear=False):
+                app = create_app()
+                body = b'{"event_name":"task.updated","task":{"id":57}}'
+                h = {"Content-Type": "application/json",
+                     "X-Provider-Signature": self._sign(body)}
+                r1, r2 = run(_post_many(app, [
+                    ("/webhook", body, h),
+                    ("/webhook", body, h),
+                ]))
+            assert r1.status == 200 and r2.status == 200
+            # Only the first reached Hermes; the duplicate was suppressed.
+            assert len(upstream.requests) == 1, len(upstream.requests)
+        finally:
+            upstream.stop()
+
+    def test_duplicate_is_suppressed_only_if_first_reached_upstream(self):
+        upstream = FakeHermes()
+        upstream.start()
+        try:
+            env = self._env(upstream)
+            with patch.dict(os.environ, env, clear=False):
+                app = create_app()
+                body = b'{"event_name":"task.updated","task":{"id":57}}'
+                h = {"Content-Type": "application/json",
+                     "X-Provider-Signature": self._sign(body)}
+                # First delivery fails upstream (no Hermes reachable on :1),
+                # so the logical retry must be allowed through — not swallowed.
+                env_bad = self._env(upstream, HERMES_URL="http://127.0.0.1:1/hermes")
+                with patch.dict(os.environ, env_bad, clear=False):
+                    app_bad = create_app()
+                    r1 = run(_post(app_bad, "/webhook", body, h))
+                assert r1.status == 502
+            # Now with a reachable Hermes, the SAME body is fresh: because the
+            # previous attempt never delivered, it is forwarded, not suppressed.
+            with patch.dict(os.environ, env, clear=False):
+                app = create_app()
+                r2 = run(_post(app, "/webhook", body, h))
+            assert r2.status == 200
+            assert len(upstream.requests) == 1
+        finally:
+            upstream.stop()
+
+    def test_distinct_bodies_are_not_suppressed(self):
+        upstream = FakeHermes()
+        upstream.start()
+        try:
+            env = self._env(upstream)
+            with patch.dict(os.environ, env, clear=False):
+                app = create_app()
+                b1 = b'{"event_name":"task.updated","task":{"id":57}}'
+                b2 = b'{"event_name":"task.updated","task":{"id":58}}'
+                r1, r2 = run(_post_many(app, [
+                    ("/webhook", b1, {"Content-Type": "application/json",
+                                      "X-Provider-Signature": self._sign(b1)}),
+                    ("/webhook", b2, {"Content-Type": "application/json",
+                                      "X-Provider-Signature": self._sign(b2)}),
+                ]))
+            assert r1.status == 200 and r2.status == 200
+            assert len(upstream.requests) == 2
+        finally:
+            upstream.stop()
+
+    def test_suppressed_duplicate_reports_outcome_in_log(self):
+        import logging
+
+        from app.main import LOG
+        upstream = FakeHermes()
+        upstream.start()
+        try:
+            env = self._env(upstream)
+            body = b'{"event_name":"task.updated","task":{"id":57}}'
+            headers = {"Content-Type": "application/json",
+                       "X-Provider-Signature": self._sign(body)}
+            with patch.dict(os.environ, env, clear=False):
+                app = create_app()
+            formatter = JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S%z")
+            with self.assertLogs(LOG, level="INFO") as cm:
+                with patch.dict(os.environ, env, clear=False):
+                    run(_post_many(app, [("/webhook", body, headers),
+                                         ("/webhook", body, headers)]))
+            records = [json.loads(formatter.format(rec)) for rec in cm.records]
+            # Two access lines: first forwarded, second suppressed.
+            assert len([r for r in records if r.get("request_path") == "/webhook"]) == 2
+            suppressed = [r for r in records if r.get("dedupe_suppressed")]
+            assert len(suppressed) == 1, records
+            assert suppressed[0]["outcome"] == "duplicate_suppressed"
+        finally:
+            upstream.stop()
 
 
 if __name__ == "__main__":

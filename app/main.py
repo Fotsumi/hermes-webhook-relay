@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -26,6 +28,7 @@ _SIG_PRESENT = web.RequestKey("provider_signature_present")
 _OUTCOME = web.RequestKey("outcome")
 _UPSTREAM_URL = web.RequestKey("upstream_url")
 _UPSTREAM_STATUS = web.RequestKey("upstream_status")
+_DEDUPE_SUPPRESSED = web.RequestKey("dedupe_suppressed")
 
 
 class JsonFormatter(logging.Formatter):
@@ -103,6 +106,7 @@ def _emit_access(request, started, status, outcome, upstream_status) -> None:
         "hermes_upstream_url": request.get(_UPSTREAM_URL),
         "hermes_upstream_status": upstream_status,
         "outcome": outcome,
+        "dedupe_suppressed": bool(request.get(_DEDUPE_SUPPRESSED)),
     }
     LOG.info("webhook request", extra={"data": data})
 
@@ -205,6 +209,60 @@ def map_payload_for_hermes(payload: dict, mapping: dict) -> dict:
     return mapped
 
 
+class Deduplicator:
+    """In-memory per-route duplicate suppression with a short TTL window.
+
+    A webhook provider (e.g. Vikunja) sometimes delivers the same event more
+    than once — identical bytes — when a bucket/position change or a retry
+    produces two `task.updated` deliveries a couple of seconds apart. Forwarding
+    both makes Hermes spawn a duplicate agent session (here, two architect-classify
+    runs fighting for the same state).
+
+    This suppresses the second delivery IF the first one already reached Hermes
+    successfully. A duplicate whose first attempt failed upstream is NOT
+    swallowed — it's a genuine retry and must be allowed through.
+
+    Keyed by (route path, sha256 of the final outgoing body) and kept in-process,
+    so the window is deliberately short and restart-safe without persistence.
+    """
+
+    def __init__(self):
+        self._seen = {}
+
+    def should_suppress(self, key: str, window_seconds: float,
+                       now: float) -> tuple[bool, dict]:
+        """Return (suppress, info). suppress=True only when a prior identical
+        delivery is still within the window AND was forwarded upstream OK."""
+        entry = self._seen.get(key)
+        if not entry:
+            self._seen[key] = {"first_seen": now, "delivered_ok": False}
+            return False, self._seen[key]
+        # Expire stale entries so an old identical body later is treated fresh.
+        young = (now - entry["first_seen"]) <= window_seconds
+        if not young:
+            entry["first_seen"] = now
+            entry["delivered_ok"] = False
+            return False, entry
+        if entry["delivered_ok"]:
+            return True, entry
+        return False, entry
+
+    def mark_delivered(self, key: str) -> None:
+        entry = self._seen.get(key)
+        if entry:
+            entry["delivered_ok"] = True
+
+    def prune(self, now: float, window_seconds: float) -> None:
+        cutoff = now - window_seconds
+        stale = [k for k, v in self._seen.items() if v["first_seen"] <= cutoff]
+        for k in stale:
+            del self._seen[k]
+
+    @staticmethod
+    def key(path: str, body: bytes) -> str:
+        return f"{path}:{hashlib.sha256(body).hexdigest()}"
+
+
 def _no_duplicate_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -273,6 +331,17 @@ def _build_payload(r, path):
     }
 
 
+def _build_dedupe(r, path):
+    return {
+        "enabled": _to_bool(
+            _value(r, "dedupe_enabled", "DEDUPE_ENABLED", True)
+        ),
+        "window_seconds": float(
+            _value(r, "dedupe_window_seconds", "DEDUPE_WINDOW_SECONDS", "5")
+        ),
+    }
+
+
 def _resolve_route(path, dest):
     if isinstance(dest, str):
         url = dest
@@ -291,6 +360,8 @@ def _resolve_route(path, dest):
                 "payload_mapping_enabled",
                 "payload_event_source",
                 "payload_event_target",
+                "dedupe_enabled",
+                "dedupe_window_seconds",
             }
         )
         if unknown:
@@ -330,6 +401,7 @@ def _resolve_route(path, dest):
         "hermes_secret": hermes_secret,
         "provider": _build_provider(r, provider_secret, path),
         "payload": _build_payload(r, path),
+        "dedupe": _build_dedupe(r, path),
     }
 
 
@@ -354,6 +426,7 @@ def load_routes():
                 "hermes_secret": os.environ["HERMES_SECRET"],
                 "provider": _build_provider(None, provider_secret, "/webhook"),
                 "payload": _build_payload(None, "/webhook"),
+                "dedupe": _build_dedupe(None, "/webhook"),
             }
         }
 
@@ -378,7 +451,7 @@ def load_routes():
     return routes
 
 
-def make_handler(cfg):
+def make_handler(cfg, dedupe=None):
     async def handle(request: web.Request) -> web.Response:
         raw_body = await request.read()
         request[_BODY_BYTES] = len(raw_body)
@@ -406,6 +479,20 @@ def make_handler(cfg):
                 separators=(",", ":"),
             ).encode("utf-8")
 
+        dedupe_cfg = cfg["dedupe"]
+        dedupe_key = None
+        if dedupe is not None and dedupe_cfg["enabled"]:
+            dedupe_key = Deduplicator.key(request.path, body)
+            suppress, _info = dedupe.should_suppress(
+                dedupe_key, dedupe_cfg["window_seconds"], time.monotonic()
+            )
+            if suppress:
+                request[_OUTCOME] = "duplicate_suppressed"
+                request[_DEDUPE_SUPPRESSED] = True
+                return web.json_response(
+                    {"status": "duplicate_suppressed"}, status=200
+                )
+
         signature = hmac.new(
             hermes_secret.encode("utf-8"),
             body,
@@ -430,6 +517,8 @@ def make_handler(cfg):
                 ) as response:
                     request[_UPSTREAM_STATUS] = response.status
                     response_body = await response.read()
+                    if dedupe is not None and dedupe_key is not None:
+                        dedupe.mark_delivered(dedupe_key)
                     return web.Response(
                         status=response.status,
                         body=response_body,
@@ -455,8 +544,36 @@ def create_app() -> web.Application:
     routes = load_routes()
     app = web.Application(middlewares=[access_log_middleware])
     app.router.add_get("/health", health)
+
+    dedupe = Deduplicator()
     for path, cfg in routes.items():
-        app.router.add_post(path, make_handler(cfg))
+        app.router.add_post(path, make_handler(cfg, dedupe))
+
+    # Periodically drop expired dedup entries so the in-memory map stays bounded
+    # even under continuous low-frequency unique deliveries.
+    max_window = max(
+        (cfg["dedupe"]["window_seconds"] for cfg in routes.values()), default=5
+    )
+    if max_window > 0:
+
+        async def _prune_dedupe_ctx(_app):
+            # Schedule pruning as a background task; yield immediately so app
+            # startup completes (an async-gen cleanup context must yield to
+            # signal "ready"). Cancel the task on shutdown.
+            async def _prune_loop():
+                while True:
+                    await asyncio.sleep(max_window)
+                    dedupe.prune(time.monotonic(), max_window)
+
+            task = asyncio.create_task(_prune_loop())
+            try:
+                yield
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        app.cleanup_ctx.append(_prune_dedupe_ctx)
     return app
 
 

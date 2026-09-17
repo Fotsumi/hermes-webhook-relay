@@ -82,7 +82,9 @@ WEBHOOK_MAP: '{
     "provider_signature_prefix": "",
     "payload_mapping_enabled": true,
     "payload_event_source": "event_name",
-    "payload_event_target": "event_type"
+    "payload_event_target": "event_type",
+    "dedupe_enabled": true,
+    "dedupe_window_seconds": 5
   },
   "/webhook2": {
     "url": "http://hermes-address:8644/webhooks/webhook2",
@@ -128,6 +130,25 @@ enabled the relay parses the JSON object, copies the source field into the
 target field (only when the source exists and the target does not), and
 preserves all original fields; when disabled it forwards the original body
 byte-for-byte untransformed.
+
+Duplicate suppression is also per-route with a global fallback:
+
+- `dedupe_enabled` — `true`/`false` (default `true`; global `DEDUPE_ENABLED`)
+- `dedupe_window_seconds` — how long an identical delivery is remembered
+  (default `5`; global `DEDUPE_WINDOW_SECONDS`)
+
+A provider such as Vikunja sometimes delivers the same `task.updated` event
+twice — byte-identical bodies a couple of seconds apart (e.g. a bucket/
+position change or a queued retry). Without a guard both reach Hermes and
+spawn a duplicate agent session. The relay suppresses the second delivery by
+hashing the final outgoing body (keyed per route) and returning the prior one's
+status, **but only when the first delivery already reached Hermes successfully**:
+a duplicate whose first attempt failed upstream (`502`) is treated as a fresh
+retry and forwarded, so an event is never lost to suppression. Suppressed
+requests are answered `200` with `{"status":"duplicate_suppressed"}` and logged
+with `"dedupe_suppressed":true` / `outcome:"duplicate_suppressed"`. The window
+is short and the store is in-memory, so a process restart cannot accidentally
+swallow a legitimate later delivery.
 
 The incoming request path alone selects the destination; a client can never
 supply or override the upstream URL, and any unconfigured path is a 404.
@@ -285,4 +306,4 @@ More generic adaptation features can be added in later versions, for example:
 - Hermes V2 timestamp signatures
 - provider event header mapping
 - selected header mapping
-- configurable event filtering
+- configurable event filtering (beyond the body-hash duplicate suppression)
